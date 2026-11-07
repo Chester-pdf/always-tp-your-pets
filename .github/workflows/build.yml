@@ -1,0 +1,706 @@
+name: Build Pet Recall
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.0'
+
+      - name: Create project files
+        run: |
+          mkdir -p src/main/java/petrecall src/main/resources src/main/resources/assets/petrecall/lang
+          cat > build.gradle <<'PETRECALL_EOF'
+          plugins {
+              id 'net.fabricmc.fabric-loom' version '1.15.5'
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+              maven { url = "https://maven.fabricmc.net/" }
+              mavenCentral()
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 25
+          }
+
+          java {
+              withSourcesJar()
+          }
+          PETRECALL_EOF
+          cat > gradle.properties <<'PETRECALL_EOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+
+          minecraft_version=26.2
+          loader_version=0.19.1
+          fabric_version=0.150.1+26.2
+
+          mod_version=1.0.0
+          maven_group=petrecall
+          archives_base_name=petrecall
+          PETRECALL_EOF
+          cat > settings.gradle <<'PETRECALL_EOF'
+          pluginManagement {
+              repositories {
+                  maven { url = "https://maven.fabricmc.net/" }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          rootProject.name = 'petrecall'
+          PETRECALL_EOF
+          cat > src/main/java/petrecall/Payloads.java <<'PETRECALL_EOF'
+          package petrecall;
+
+          import io.netty.buffer.ByteBuf;
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.UUID;
+          import net.minecraft.network.codec.ByteBufCodecs;
+          import net.minecraft.network.codec.StreamCodec;
+          import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+          import net.minecraft.resources.Identifier;
+
+          public final class Payloads {
+              private Payloads() {}
+
+              private static <T extends CustomPacketPayload> CustomPacketPayload.Type<T> mk(String path) {
+                  return new CustomPacketPayload.Type<>(Identifier.fromNamespaceAndPath(PetRecall.MOD_ID, path));
+              }
+
+              private static void wUuid(ByteBuf b, UUID id) {
+                  b.writeLong(id.getMostSignificantBits());
+                  b.writeLong(id.getLeastSignificantBits());
+              }
+
+              private static UUID rUuid(ByteBuf b) {
+                  return new UUID(b.readLong(), b.readLong());
+              }
+
+              private static void wStr(ByteBuf b, String s) {
+                  ByteBufCodecs.STRING_UTF8.encode(b, s);
+              }
+
+              private static String rStr(ByteBuf b) {
+                  return ByteBufCodecs.STRING_UTF8.decode(b);
+              }
+
+              /** Клиент -> сервер: прислать список питомцев (открыть меню). */
+              public record RequestListC2S() implements CustomPacketPayload {
+                  public static final CustomPacketPayload.Type<RequestListC2S> TYPE = mk("request_list");
+                  public static final StreamCodec<ByteBuf, RequestListC2S> CODEC = StreamCodec.unit(new RequestListC2S());
+
+                  @Override
+                  public CustomPacketPayload.Type<? extends CustomPacketPayload> type() {
+                      return TYPE;
+                  }
+              }
+
+              /** Клиент -> сервер: призвать питомца (или всех). */
+              public record RecallC2S(UUID id, boolean all, boolean stand) implements CustomPacketPayload {
+                  public static final CustomPacketPayload.Type<RecallC2S> TYPE = mk("recall");
+                  public static final StreamCodec<ByteBuf, RecallC2S> CODEC = StreamCodec.<ByteBuf, RecallC2S>of(
+                          (buf, v) -> {
+                              wUuid(buf, v.id());
+                              buf.writeBoolean(v.all());
+                              buf.writeBoolean(v.stand());
+                          },
+                          buf -> new RecallC2S(rUuid(buf), buf.readBoolean(), buf.readBoolean()));
+
+                  @Override
+                  public CustomPacketPayload.Type<? extends CustomPacketPayload> type() {
+                      return TYPE;
+                  }
+              }
+
+              public record PetEntry(UUID id, String name, String type, String dim, int x, int y, int z, boolean loaded) {
+                  void write(ByteBuf b) {
+                      wUuid(b, id);
+                      wStr(b, name);
+                      wStr(b, type);
+                      wStr(b, dim);
+                      b.writeInt(x);
+                      b.writeInt(y);
+                      b.writeInt(z);
+                      b.writeBoolean(loaded);
+                  }
+
+                  static PetEntry read(ByteBuf b) {
+                      return new PetEntry(rUuid(b), rStr(b), rStr(b), rStr(b),
+                              b.readInt(), b.readInt(), b.readInt(), b.readBoolean());
+                  }
+              }
+
+              /** Сервер -> клиент: список питомцев. open=true — открыть экран, false — только обновить, если открыт. */
+              public record ListS2C(boolean open, List<PetEntry> pets) implements CustomPacketPayload {
+                  public static final CustomPacketPayload.Type<ListS2C> TYPE = mk("list");
+                  public static final StreamCodec<ByteBuf, ListS2C> CODEC = StreamCodec.<ByteBuf, ListS2C>of(
+                          (buf, v) -> {
+                              buf.writeBoolean(v.open());
+                              buf.writeInt(v.pets().size());
+                              for (PetEntry p : v.pets()) p.write(buf);
+                          },
+                          buf -> {
+                              boolean open = buf.readBoolean();
+                              int n = buf.readInt();
+                              List<PetEntry> l = new ArrayList<>();
+                              for (int i = 0; i < n; i++) l.add(PetEntry.read(buf));
+                              return new ListS2C(open, l);
+                          });
+
+                  @Override
+                  public CustomPacketPayload.Type<? extends CustomPacketPayload> type() {
+                      return TYPE;
+                  }
+              }
+          }
+          PETRECALL_EOF
+          cat > src/main/java/petrecall/PetManager.java <<'PETRECALL_EOF'
+          package petrecall;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import com.google.gson.reflect.TypeToken;
+          import java.io.Reader;
+          import java.io.Writer;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.Comparator;
+          import java.util.HashMap;
+          import java.util.Iterator;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.UUID;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+          import net.minecraft.core.SectionPos;
+          import net.minecraft.core.registries.BuiltInRegistries;
+          import net.minecraft.core.registries.Registries;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.resources.Identifier;
+          import net.minecraft.resources.ResourceKey;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerLevel;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.entity.Entity;
+          import net.minecraft.world.entity.Mob;
+          import net.minecraft.world.entity.OwnableEntity;
+          import net.minecraft.world.entity.TamableAnimal;
+          import net.minecraft.world.level.ChunkPos;
+          import net.minecraft.world.level.portal.TeleportTransition;
+          import net.minecraft.world.level.storage.LevelResource;
+          import net.minecraft.world.phys.Vec3;
+
+          /** Реестр питомцев (сохраняется в папке мира) + логика призыва. */
+          public final class PetManager {
+              private PetManager() {}
+
+              public static class Info {
+                  public String owner, name, type, dim;
+                  public int x, y, z;
+              }
+
+              private static class Pending {
+                  UUID player, pet;
+                  ServerLevel level;
+                  int cx, cz, left;
+                  boolean forced, stand;
+              }
+
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+              private static final Map<UUID, Info> PETS = new HashMap<>();
+              private static final List<Pending> PENDING = new ArrayList<>();
+              private static MinecraftServer server;
+              private static Path file;
+              private static boolean dirty;
+              private static int ticks;
+
+              // ---------- жизненный цикл ----------
+
+              public static void onStart(MinecraftServer s) {
+                  server = s;
+                  PETS.clear();
+                  PENDING.clear();
+                  file = s.getWorldPath(LevelResource.ROOT).resolve("petrecall.json");
+                  if (Files.exists(file)) {
+                      try (Reader r = Files.newBufferedReader(file)) {
+                          Map<String, Info> m = GSON.fromJson(r, new TypeToken<Map<String, Info>>() {}.getType());
+                          if (m != null) m.forEach((k, v) -> PETS.put(UUID.fromString(k), v));
+                      } catch (Exception ex) {
+                          PetRecall.LOG.error("Не удалось прочитать petrecall.json", ex);
+                      }
+                  }
+              }
+
+              public static void onStop(MinecraftServer s) {
+                  for (Pending p : PENDING) release(p);
+                  PENDING.clear();
+                  save();
+              }
+
+              private static void save() {
+                  if (file == null) return;
+                  Map<String, Info> m = new HashMap<>();
+                  PETS.forEach((k, v) -> m.put(k.toString(), v));
+                  try (Writer w = Files.newBufferedWriter(file)) {
+                      GSON.toJson(m, w);
+                      dirty = false;
+                  } catch (Exception ex) {
+                      PetRecall.LOG.error("Не удалось сохранить petrecall.json", ex);
+                  }
+              }
+
+              public static void tick(MinecraftServer s) {
+                  ticks++;
+                  if (ticks % 40 == 0) {
+                      for (ServerLevel lvl : s.getAllLevels()) {
+                          for (Entity e : lvl.getAllEntities()) track(e, false);
+                      }
+                  }
+                  if (ticks % 1200 == 0 && dirty) save();
+                  if (!PENDING.isEmpty()) processPending();
+              }
+
+              // ---------- учёт питомцев ----------
+
+              public static void trackOnUnload(Entity e) {
+                  Entity.RemovalReason r = e.getRemovalReason();
+                  // обновляем позицию только при выгрузке чанка, не при смерти/смене измерения
+                  if (r == null || r.shouldSave()) track(e, true);
+              }
+
+              public static void track(Entity e, boolean unloading) {
+                  if (!(e instanceof OwnableEntity o)) return;
+                  if (!(e.level() instanceof ServerLevel lvl)) return;
+                  if (!unloading && e.isRemoved()) return;
+
+                  var ref = o.getOwnerReference();
+                  if (ref == null) { // приручение снято
+                      forget(e.getUUID());
+                      return;
+                  }
+                  Info i = new Info();
+                  i.owner = ref.getUUID().toString();
+                  i.name = e.getName().getString();
+                  i.type = BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).toString();
+                  i.dim = lvl.dimension().identifier().toString();
+                  i.x = e.getBlockX();
+                  i.y = e.getBlockY();
+                  i.z = e.getBlockZ();
+
+                  Info old = PETS.get(e.getUUID());
+                  if (old == null || !same(old, i)) {
+                      PETS.put(e.getUUID(), i);
+                      dirty = true;
+                  }
+              }
+
+              private static boolean same(Info a, Info b) {
+                  return a.owner.equals(b.owner) && a.name.equals(b.name) && a.type.equals(b.type)
+                          && a.dim.equals(b.dim) && a.x == b.x && a.y == b.y && a.z == b.z;
+              }
+
+              public static void forget(UUID id) {
+                  if (PETS.remove(id) != null) dirty = true;
+              }
+
+              // ---------- список ----------
+
+              private static ServerLevel level(String dim) {
+                  return server.getLevel(ResourceKey.create(Registries.DIMENSION, Identifier.parse(dim)));
+              }
+
+              public static void sendList(ServerPlayer player, boolean open) {
+                  String me = player.getUUID().toString();
+                  List<Payloads.PetEntry> out = new ArrayList<>();
+                  for (Map.Entry<UUID, Info> en : PETS.entrySet()) {
+                      Info i = en.getValue();
+                      if (!i.owner.equals(me)) continue; // только свои питомцы
+                      ServerLevel l = level(i.dim);
+                      boolean loaded = l != null && l.getEntity(en.getKey()) != null;
+                      out.add(new Payloads.PetEntry(en.getKey(), i.name, i.type, i.dim, i.x, i.y, i.z, loaded));
+                  }
+                  out.sort(Comparator.comparing(Payloads.PetEntry::name));
+                  ServerPlayNetworking.send(player, new Payloads.ListS2C(open, out));
+              }
+
+              // ---------- призыв ----------
+
+              public static void recall(ServerPlayer player, Payloads.RecallC2S req) {
+                  if (req.all()) {
+                      String me = player.getUUID().toString();
+                      List<UUID> ids = new ArrayList<>();
+                      PETS.forEach((id, i) -> {
+                          if (i.owner.equals(me)) ids.add(id);
+                      });
+                      for (UUID id : ids) start(player, id, req.stand());
+                  } else {
+                      start(player, req.id(), req.stand());
+                  }
+                  sendList(player, false);
+              }
+
+              private static void start(ServerPlayer player, UUID id, boolean stand) {
+                  Info i = PETS.get(id);
+                  // защита: чужих питомцев трогать нельзя
+                  if (i == null || !i.owner.equals(player.getUUID().toString())) return;
+                  for (Pending p : PENDING) if (p.pet.equals(id)) return;
+
+                  ServerLevel l = level(i.dim);
+                  if (l == null) {
+                      player.sendSystemMessage(Component.translatable("petrecall.msg.no_world"), true);
+                      return;
+                  }
+                  Entity e = l.getEntity(id);
+                  if (e != null) {
+                      move(e, player, stand);
+                      return;
+                  }
+                  // питомец не загружен: временно грузим чанк, где его видели в последний раз
+                  Pending p = new Pending();
+                  p.player = player.getUUID();
+                  p.pet = id;
+                  p.level = l;
+                  p.cx = SectionPos.blockToSectionCoord(i.x);
+                  p.cz = SectionPos.blockToSectionCoord(i.z);
+                  p.left = 200; // 10 секунд
+                  p.stand = stand;
+                  p.forced = !l.getForcedChunks().contains(ChunkPos.asLong(p.cx, p.cz));
+                  if (p.forced) l.setChunkForced(p.cx, p.cz, true);
+                  PENDING.add(p);
+              }
+
+              private static void processPending() {
+                  Iterator<Pending> it = PENDING.iterator();
+                  while (it.hasNext()) {
+                      Pending p = it.next();
+                      ServerPlayer pl = server.getPlayerList().getPlayer(p.player);
+                      if (pl == null) {
+                          release(p);
+                          it.remove();
+                          continue;
+                      }
+                      Entity e = p.level.getEntity(p.pet);
+                      if (e != null) {
+                          move(e, pl, p.stand);
+                          release(p);
+                          it.remove();
+                          sendList(pl, false);
+                      } else if (--p.left <= 0) {
+                          pl.sendSystemMessage(Component.translatable("petrecall.msg.not_found"), true);
+                          release(p);
+                          it.remove();
+                          sendList(pl, false);
+                      }
+                  }
+              }
+
+              private static void release(Pending p) {
+                  if (p.forced) p.level.setChunkForced(p.cx, p.cz, false);
+              }
+
+              private static void move(Entity e, ServerPlayer player, boolean stand) {
+                  if (e instanceof Mob m) {
+                      m.getNavigation().stop();
+                      m.setTarget(null);
+                  }
+                  if (stand && e instanceof TamableAnimal t) {
+                      t.setOrderedToSit(false);
+                      t.setInSittingPose(false);
+                  }
+                  ServerLevel target = (ServerLevel) player.level();
+                  Entity moved = e.teleport(new TeleportTransition(
+                          target, player.position(), Vec3.ZERO, e.getYRot(), e.getXRot(),
+                          TeleportTransition.DO_NOTHING));
+                  if (moved != null) track(moved, false);
+              }
+          }
+          PETRECALL_EOF
+          cat > src/main/java/petrecall/PetRecall.java <<'PETRECALL_EOF'
+          package petrecall;
+
+          import net.fabricmc.api.ModInitializer;
+          import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+          import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+
+          public class PetRecall implements ModInitializer {
+              public static final String MOD_ID = "petrecall";
+              public static final Logger LOG = LoggerFactory.getLogger(MOD_ID);
+
+              @Override
+              public void onInitialize() {
+                  PayloadTypeRegistry.playC2S().register(Payloads.RequestListC2S.TYPE, Payloads.RequestListC2S.CODEC);
+                  PayloadTypeRegistry.playC2S().register(Payloads.RecallC2S.TYPE, Payloads.RecallC2S.CODEC);
+                  PayloadTypeRegistry.playS2C().register(Payloads.ListS2C.TYPE, Payloads.ListS2C.CODEC);
+
+                  ServerPlayNetworking.registerGlobalReceiver(Payloads.RequestListC2S.TYPE,
+                          (payload, ctx) -> PetManager.sendList(ctx.player(), true));
+                  ServerPlayNetworking.registerGlobalReceiver(Payloads.RecallC2S.TYPE,
+                          (payload, ctx) -> PetManager.recall(ctx.player(), payload));
+
+                  ServerLifecycleEvents.SERVER_STARTED.register(PetManager::onStart);
+                  ServerLifecycleEvents.SERVER_STOPPING.register(PetManager::onStop);
+                  ServerTickEvents.END_SERVER_TICK.register(PetManager::tick);
+                  ServerEntityEvents.ENTITY_LOAD.register((entity, world) -> PetManager.track(entity, false));
+                  ServerEntityEvents.ENTITY_UNLOAD.register((entity, world) -> PetManager.trackOnUnload(entity));
+                  ServerLivingEntityEvents.AFTER_DEATH.register((entity, source) -> PetManager.forget(entity.getUUID()));
+              }
+          }
+          PETRECALL_EOF
+          cat > src/main/java/petrecall/PetRecallClient.java <<'PETRECALL_EOF'
+          package petrecall;
+
+          import com.mojang.blaze3d.platform.InputConstants;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+          import net.minecraft.client.KeyMapping;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.resources.Identifier;
+          import org.lwjgl.glfw.GLFW;
+
+          public class PetRecallClient implements ClientModInitializer {
+              private static KeyMapping openKey;
+              /** Вставать ли сидячим питомцам после телепорта. */
+              public static boolean standUp = false;
+
+              @Override
+              public void onInitializeClient() {
+                  KeyMapping.Category cat = KeyMapping.Category.register(
+                          Identifier.fromNamespaceAndPath(PetRecall.MOD_ID, "main"));
+                  openKey = KeyMappingHelper.registerKeyMapping(
+                          new KeyMapping("key.petrecall.open", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_P, cat));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(mc -> {
+                      while (openKey.consumeClick()) {
+                          if (mc.player != null && mc.screen == null) {
+                              ClientPlayNetworking.send(new Payloads.RequestListC2S());
+                          }
+                      }
+                  });
+
+                  ClientPlayNetworking.registerGlobalReceiver(Payloads.ListS2C.TYPE, (payload, ctx) -> {
+                      Minecraft mc = ctx.client();
+                      if (mc.screen instanceof PetScreen s) {
+                          s.update(payload.pets());
+                      } else if (payload.open()) {
+                          mc.setScreen(new PetScreen(payload.pets()));
+                      }
+                  });
+              }
+          }
+          PETRECALL_EOF
+          cat > src/main/java/petrecall/PetScreen.java <<'PETRECALL_EOF'
+          package petrecall;
+
+          import java.util.List;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+          import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.network.chat.Component;
+
+          public class PetScreen extends Screen {
+              private static final int PER_PAGE = 6;
+              private static final int ROW_H = 30;
+
+              private List<Payloads.PetEntry> pets;
+              private int page;
+
+              public PetScreen(List<Payloads.PetEntry> pets) {
+                  super(Component.translatable("petrecall.title"));
+                  this.pets = pets;
+              }
+
+              public void update(List<Payloads.PetEntry> list) {
+                  this.pets = list;
+                  int max = Math.max(0, (pets.size() - 1) / PER_PAGE);
+                  if (page > max) page = max;
+                  rebuildWidgets();
+              }
+
+              private int left() {
+                  return this.width / 2 - 160;
+              }
+
+              @Override
+              protected void init() {
+                  int left = left();
+                  int top = 36;
+                  int from = page * PER_PAGE;
+                  int to = Math.min(pets.size(), from + PER_PAGE);
+
+                  for (int i = from; i < to; i++) {
+                      Payloads.PetEntry pet = pets.get(i);
+                      int y = top + (i - from) * ROW_H;
+                      addRenderableWidget(Button.builder(Component.translatable("petrecall.recall"),
+                                      b -> ClientPlayNetworking.send(
+                                              new Payloads.RecallC2S(pet.id(), false, PetRecallClient.standUp)))
+                              .bounds(left + 230, y + 2, 90, 20).build());
+                  }
+
+                  int by = top + PER_PAGE * ROW_H + 8;
+                  addRenderableWidget(Button.builder(Component.literal("<"), b -> {
+                      if (page > 0) {
+                          page--;
+                          rebuildWidgets();
+                      }
+                  }).bounds(left, by, 30, 20).build());
+                  addRenderableWidget(Button.builder(Component.literal(">"), b -> {
+                      if ((page + 1) * PER_PAGE < pets.size()) {
+                          page++;
+                          rebuildWidgets();
+                      }
+                  }).bounds(left + 34, by, 30, 20).build());
+                  addRenderableWidget(Button.builder(Component.translatable("petrecall.all"),
+                                  b -> ClientPlayNetworking.send(
+                                          new Payloads.RecallC2S(new java.util.UUID(0, 0), true, PetRecallClient.standUp)))
+                          .bounds(left + 68, by, 100, 20).build());
+                  addRenderableWidget(Button.builder(
+                                  Component.translatable(PetRecallClient.standUp ? "petrecall.stand_on" : "petrecall.stand_off"),
+                                  b -> {
+                                      PetRecallClient.standUp = !PetRecallClient.standUp;
+                                      rebuildWidgets();
+                                  })
+                          .bounds(left + 172, by, 90, 20).build());
+                  addRenderableWidget(Button.builder(Component.translatable("petrecall.close"), b -> onClose())
+                          .bounds(left + 266, by, 54, 20).build());
+              }
+
+              @Override
+              public void render(GuiGraphics g, int mouseX, int mouseY, float delta) {
+                  super.render(g, mouseX, mouseY, delta);
+                  g.drawCenteredString(this.font, this.title, this.width / 2, 14, 0xFFFFFFFF);
+
+                  if (pets.isEmpty()) {
+                      g.drawCenteredString(this.font, Component.translatable("petrecall.empty"),
+                              this.width / 2, 60, 0xFFAAAAAA);
+                      return;
+                  }
+                  int left = left();
+                  int top = 36;
+                  int from = page * PER_PAGE;
+                  int to = Math.min(pets.size(), from + PER_PAGE);
+                  for (int i = from; i < to; i++) {
+                      Payloads.PetEntry p = pets.get(i);
+                      int y = top + (i - from) * ROW_H;
+                      String title = p.name() + " (" + shortType(p.type()) + ")";
+                      g.drawString(this.font, title, left, y + 2, 0xFFFFFFFF);
+                      String sub = dimName(p.dim()) + "  " + p.x() + " " + p.y() + " " + p.z();
+                      if (!p.loaded()) sub += "  [" + Component.translatable("petrecall.unloaded").getString() + "]";
+                      g.drawString(this.font, sub, left, y + 14, p.loaded() ? 0xFF55FF55 : 0xFFAAAAAA);
+                  }
+              }
+
+              private static String shortType(String t) {
+                  int c = t.indexOf(':');
+                  return c >= 0 ? t.substring(c + 1) : t;
+              }
+
+              private static String dimName(String d) {
+                  return switch (d) {
+                      case "minecraft:overworld" -> "Верхний мир";
+                      case "minecraft:the_nether" -> "Нижний мир";
+                      case "minecraft:the_end" -> "Энд";
+                      default -> d;
+                  };
+              }
+          }
+          PETRECALL_EOF
+          cat > src/main/resources/assets/petrecall/lang/en_us.json <<'PETRECALL_EOF'
+          {
+            "key.petrecall.open": "Pet menu",
+            "key.category.petrecall.main": "Pet Recall",
+            "petrecall.title": "My pets",
+            "petrecall.recall": "Recall",
+            "petrecall.all": "Recall all",
+            "petrecall.stand_on": "Stand up: yes",
+            "petrecall.stand_off": "Stand up: no",
+            "petrecall.empty": "You have no pets yet",
+            "petrecall.unloaded": "unloaded",
+            "petrecall.close": "Close",
+            "petrecall.msg.not_found": "Pet not found (it may be gone)",
+            "petrecall.msg.no_world": "The pet's world is unavailable"
+          }
+          PETRECALL_EOF
+          cat > src/main/resources/assets/petrecall/lang/ru_ru.json <<'PETRECALL_EOF'
+          {
+            "key.petrecall.open": "Меню питомцев",
+            "key.category.petrecall.main": "Pet Recall",
+            "petrecall.title": "Мои питомцы",
+            "petrecall.recall": "К себе",
+            "petrecall.all": "Всех к себе",
+            "petrecall.stand_on": "Вставать: да",
+            "petrecall.stand_off": "Вставать: нет",
+            "petrecall.empty": "У тебя пока нет питомцев",
+            "petrecall.unloaded": "не загружен",
+            "petrecall.close": "Закрыть",
+            "petrecall.msg.not_found": "Питомец не найден (возможно, его больше нет)",
+            "petrecall.msg.no_world": "Мир питомца недоступен"
+          }
+          PETRECALL_EOF
+          cat > src/main/resources/fabric.mod.json <<'PETRECALL_EOF'
+          {
+            "schemaVersion": 1,
+            "id": "petrecall",
+            "version": "1.0.0",
+            "name": "Pet Recall",
+            "description": "Меню питомцев: телепорт своих питомцев к себе, даже сидячих и незагруженных, между измерениями.",
+            "environment": "*",
+            "entrypoints": {
+              "main": ["petrecall.PetRecall"],
+              "client": ["petrecall.PetRecallClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.19.1",
+              "minecraft": ">=26.2",
+              "java": ">=25",
+              "fabric-api": "*"
+            }
+          }
+          PETRECALL_EOF
+
+      - name: Build
+        run: gradle build --no-daemon
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: petrecall-jar
+          path: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
