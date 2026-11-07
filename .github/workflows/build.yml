@@ -392,7 +392,7 @@ jobs:
                   p.cz = SectionPos.blockToSectionCoord(i.z);
                   p.left = 200; // 10 секунд
                   p.stand = stand;
-                  p.forced = !l.getForcedChunks().contains(ChunkPos.asLong(p.cx, p.cz));
+                  p.forced = !l.getChunkSource().getForceLoadedChunks().contains(ChunkPos.pack(p.cx, p.cz));
                   if (p.forced) l.setChunkForced(p.cx, p.cz, true);
                   PENDING.add(p);
               }
@@ -462,9 +462,9 @@ jobs:
 
               @Override
               public void onInitialize() {
-                  PayloadTypeRegistry.playC2S().register(Payloads.RequestListC2S.TYPE, Payloads.RequestListC2S.CODEC);
-                  PayloadTypeRegistry.playC2S().register(Payloads.RecallC2S.TYPE, Payloads.RecallC2S.CODEC);
-                  PayloadTypeRegistry.playS2C().register(Payloads.ListS2C.TYPE, Payloads.ListS2C.CODEC);
+                  PayloadTypeRegistry.serverboundPlay().register(Payloads.RequestListC2S.TYPE, Payloads.RequestListC2S.CODEC);
+                  PayloadTypeRegistry.serverboundPlay().register(Payloads.RecallC2S.TYPE, Payloads.RecallC2S.CODEC);
+                  PayloadTypeRegistry.clientboundPlay().register(Payloads.ListS2C.TYPE, Payloads.ListS2C.CODEC);
 
                   ServerPlayNetworking.registerGlobalReceiver(Payloads.RequestListC2S.TYPE,
                           (payload, ctx) -> PetManager.sendList(ctx.player(), true));
@@ -507,7 +507,7 @@ jobs:
 
                   ClientTickEvents.END_CLIENT_TICK.register(mc -> {
                       while (openKey.consumeClick()) {
-                          if (mc.player != null && mc.screen == null) {
+                          if (mc.player != null && mc.gui.screen() == null) {
                               ClientPlayNetworking.send(new Payloads.RequestListC2S());
                           }
                       }
@@ -515,10 +515,10 @@ jobs:
 
                   ClientPlayNetworking.registerGlobalReceiver(Payloads.ListS2C.TYPE, (payload, ctx) -> {
                       Minecraft mc = ctx.client();
-                      if (mc.screen instanceof PetScreen s) {
+                      if (mc.gui.screen() instanceof PetScreen s) {
                           s.update(payload.pets());
                       } else if (payload.open()) {
-                          mc.setScreen(new PetScreen(payload.pets()));
+                          mc.setScreenAndShow(new PetScreen(payload.pets()));
                       }
                   });
               }
@@ -529,7 +529,7 @@ jobs:
 
           import java.util.List;
           import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
-          import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.client.gui.GuiGraphicsExtractor;
           import net.minecraft.client.gui.components.Button;
           import net.minecraft.client.gui.screens.Screen;
           import net.minecraft.network.chat.Component;
@@ -602,12 +602,12 @@ jobs:
               }
 
               @Override
-              public void render(GuiGraphics g, int mouseX, int mouseY, float delta) {
-                  super.render(g, mouseX, mouseY, delta);
-                  g.drawCenteredString(this.font, this.title, this.width / 2, 14, 0xFFFFFFFF);
+              public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float delta) {
+                  super.extractRenderState(g, mouseX, mouseY, delta);
+                  g.centeredText(this.font, this.title, this.width / 2, 14, 0xFFFFFFFF);
 
                   if (pets.isEmpty()) {
-                      g.drawCenteredString(this.font, Component.translatable("petrecall.empty"),
+                      g.centeredText(this.font, Component.translatable("petrecall.empty"),
                               this.width / 2, 60, 0xFFAAAAAA);
                       return;
                   }
@@ -619,10 +619,10 @@ jobs:
                       Payloads.PetEntry p = pets.get(i);
                       int y = top + (i - from) * ROW_H;
                       String title = p.name() + " (" + shortType(p.type()) + ")";
-                      g.drawString(this.font, title, left, y + 2, 0xFFFFFFFF);
+                      g.text(this.font, title, left, y + 2, 0xFFFFFFFF, true);
                       String sub = dimName(p.dim()) + "  " + p.x() + " " + p.y() + " " + p.z();
                       if (!p.loaded()) sub += "  [" + Component.translatable("petrecall.unloaded").getString() + "]";
-                      g.drawString(this.font, sub, left, y + 14, p.loaded() ? 0xFF55FF55 : 0xFFAAAAAA);
+                      g.text(this.font, sub, left, y + 14, p.loaded() ? 0xFF55FF55 : 0xFFAAAAAA, true);
                   }
               }
 
@@ -703,4 +703,4 @@ jobs:
           name: petrecall-jar
           path: |
             build/libs/*.jar
-            !build/libs/*-sources.jar
+            !build/libs/ubuntu-latest
