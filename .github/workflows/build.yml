@@ -62,7 +62,7 @@ jobs:
           loader_version=0.19.1
           fabric_version=0.150.1+26.2
 
-          mod_version=1.0.0
+          mod_version=1.1.0
           maven_group=petrecall
           archives_base_name=petrecall
           PETRECALL_EOF
@@ -218,7 +218,11 @@ jobs:
           import net.minecraft.world.level.storage.LevelResource;
           import net.minecraft.world.phys.Vec3;
 
-          /** Реестр питомцев (сохраняется в папке мира) + логика призыва. */
+          /**
+           * Реестр питомцев (сохраняется в папке мира) + логика призыва.
+           * Работает с любым питомцем, у которого есть хозяин (OwnableEntity): волки, кошки, попугаи,
+           * приручённые лошади и т.п., а также кролики из мода Rabbit Taming.
+           */
           public final class PetManager {
               private PetManager() {}
 
@@ -302,7 +306,7 @@ jobs:
                   if (!unloading && e.isRemoved()) return;
 
                   var ref = o.getOwnerReference();
-                  if (ref == null) { // приручение снято
+                  if (ref == null) { // приручение снято (или дикое животное)
                       forget(e.getUUID());
                       return;
                   }
@@ -426,15 +430,29 @@ jobs:
                   if (p.forced) p.level.setChunkForced(p.cx, p.cz, false);
               }
 
+              /**
+               * Заставляет питомца встать. Волки, кошки, попугаи — через TamableAnimal.
+               * Кролики из Rabbit Taming — через метод rt$setSitting (мод необязателен, поэтому рефлексия).
+               */
+              private static void unsit(Entity e) {
+                  if (e instanceof TamableAnimal t) {
+                      t.setOrderedToSit(false);
+                      t.setInSittingPose(false);
+                      return;
+                  }
+                  try {
+                      e.getClass().getMethod("rt$setSitting", boolean.class).invoke(e, false);
+                  } catch (ReflectiveOperationException | RuntimeException ignored) {
+                      // у этого питомца нет «сидения» — ничего не делаем
+                  }
+              }
+
               private static void move(Entity e, ServerPlayer player, boolean stand) {
                   if (e instanceof Mob m) {
                       m.getNavigation().stop();
                       m.setTarget(null);
                   }
-                  if (stand && e instanceof TamableAnimal t) {
-                      t.setOrderedToSit(false);
-                      t.setInSittingPose(false);
-                  }
+                  if (stand) unsit(e);
                   ServerLevel target = (ServerLevel) player.level();
                   Entity moved = e.teleport(new TeleportTransition(
                           target, player.position(), Vec3.ZERO, e.getYRot(), e.getXRot(),
@@ -677,9 +695,9 @@ jobs:
           {
             "schemaVersion": 1,
             "id": "petrecall",
-            "version": "1.0.0",
+            "version": "1.1.0",
             "name": "Pet Recall",
-            "description": "Меню питомцев: телепорт своих питомцев к себе, даже сидячих и незагруженных, между измерениями.",
+            "description": "Меню питомцев: телепорт своих питомцев (волки, кошки, кролики из Rabbit Taming и др.) к себе, даже сидячих и незагруженных, между измерениями.",
             "environment": "*",
             "entrypoints": {
               "main": ["petrecall.PetRecall"],
@@ -703,4 +721,4 @@ jobs:
           name: petrecall-jar
           path: |
             build/libs/*.jar
-            !build/libs/ubuntu-latest
+            !build/libs/*-sources.jar
