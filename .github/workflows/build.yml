@@ -62,7 +62,7 @@ jobs:
           loader_version=0.19.1
           fabric_version=0.150.1+26.2
 
-          mod_version=1.1.0
+          mod_version=1.1.1
           maven_group=petrecall
           archives_base_name=petrecall
           PETRECALL_EOF
@@ -210,6 +210,7 @@ jobs:
           import net.minecraft.server.level.ServerLevel;
           import net.minecraft.server.level.ServerPlayer;
           import net.minecraft.world.entity.Entity;
+          import net.minecraft.world.entity.LivingEntity;
           import net.minecraft.world.entity.Mob;
           import net.minecraft.world.entity.OwnableEntity;
           import net.minecraft.world.entity.TamableAnimal;
@@ -304,6 +305,10 @@ jobs:
                   if (!(e instanceof OwnableEntity o)) return;
                   if (!(e.level() instanceof ServerLevel lvl)) return;
                   if (!unloading && e.isRemoved()) return;
+                  if (e instanceof LivingEntity le && le.isDeadOrDying()) { // погиб - убираем из списка
+                      forget(e.getUUID());
+                      return;
+                  }
 
                   var ref = o.getOwnerReference();
                   if (ref == null) { // приручение снято (или дикое животное)
@@ -344,15 +349,26 @@ jobs:
               public static void sendList(ServerPlayer player, boolean open) {
                   String me = player.getUUID().toString();
                   List<Payloads.PetEntry> out = new ArrayList<>();
+                  List<UUID> gone = new ArrayList<>();
                   for (Map.Entry<UUID, Info> en : PETS.entrySet()) {
                       Info i = en.getValue();
                       if (!i.owner.equals(me)) continue; // только свои питомцы
                       ServerLevel l = level(i.dim);
-                      boolean loaded = l != null && l.getEntity(en.getKey()) != null;
-                      out.add(new Payloads.PetEntry(en.getKey(), i.name, i.type, i.dim, i.x, i.y, i.z, loaded));
+                      Entity live = l == null ? null : l.getEntity(en.getKey());
+                      if (live != null && isDead(live)) { // питомец погиб - в список не попадает
+                          gone.add(en.getKey());
+                          continue;
+                      }
+                      out.add(new Payloads.PetEntry(en.getKey(), i.name, i.type, i.dim, i.x, i.y, i.z, live != null));
                   }
+                  for (UUID id : gone) forget(id);
                   out.sort(Comparator.comparing(Payloads.PetEntry::name));
                   ServerPlayNetworking.send(player, new Payloads.ListS2C(open, out));
+              }
+
+              /** Питомец мёртв или уже удалён из мира. */
+              private static boolean isDead(Entity e) {
+                  return e.isRemoved() || (e instanceof LivingEntity le && le.isDeadOrDying());
               }
 
               // ---------- призыв ----------
@@ -384,6 +400,11 @@ jobs:
                   }
                   Entity e = l.getEntity(id);
                   if (e != null) {
+                      if (isDead(e)) { // питомец погиб
+                          forget(id);
+                          player.sendSystemMessage(Component.translatable("petrecall.msg.dead"), true);
+                          return;
+                      }
                       move(e, player, stand);
                       return;
                   }
@@ -413,11 +434,19 @@ jobs:
                       }
                       Entity e = p.level.getEntity(p.pet);
                       if (e != null) {
-                          move(e, pl, p.stand);
+                          if (isDead(e)) {
+                              forget(p.pet);
+                              pl.sendSystemMessage(Component.translatable("petrecall.msg.dead"), true);
+                          } else {
+                              move(e, pl, p.stand);
+                          }
                           release(p);
                           it.remove();
                           sendList(pl, false);
                       } else if (--p.left <= 0) {
+                          // Чанк питомца всё это время был загружен, а его там нет: питомец погиб или исчез.
+                          // Если он где-то ещё жив, мод снова заметит его при загрузке.
+                          forget(p.pet);
                           pl.sendSystemMessage(Component.translatable("petrecall.msg.not_found"), true);
                           release(p);
                           it.remove();
@@ -671,7 +700,8 @@ jobs:
             "petrecall.empty": "You have no pets yet",
             "petrecall.unloaded": "unloaded",
             "petrecall.close": "Close",
-            "petrecall.msg.not_found": "Pet not found (it may be gone)",
+            "petrecall.msg.not_found": "Pet not found (it may be dead) - removed from the list",
+            "petrecall.msg.dead": "The pet is dead",
             "petrecall.msg.no_world": "The pet's world is unavailable"
           }
           PETRECALL_EOF
@@ -687,7 +717,8 @@ jobs:
             "petrecall.empty": "У тебя пока нет питомцев",
             "petrecall.unloaded": "не загружен",
             "petrecall.close": "Закрыть",
-            "petrecall.msg.not_found": "Питомец не найден (возможно, его больше нет)",
+            "petrecall.msg.not_found": "Питомец не найден (возможно, он погиб) - убран из списка",
+            "petrecall.msg.dead": "Питомец погиб",
             "petrecall.msg.no_world": "Мир питомца недоступен"
           }
           PETRECALL_EOF
@@ -695,7 +726,7 @@ jobs:
           {
             "schemaVersion": 1,
             "id": "petrecall",
-            "version": "1.1.0",
+            "version": "1.1.1",
             "name": "Pet Recall",
             "description": "Меню питомцев: телепорт своих питомцев (волки, кошки, кролики из Rabbit Taming и др.) к себе, даже сидячих и незагруженных, между измерениями.",
             "environment": "*",
